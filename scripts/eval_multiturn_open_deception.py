@@ -56,6 +56,19 @@ DEFAULT_PATHS = {
         "out_txt": RESULTS_DIR / "multiturn_response_eval.txt",
         "out_json": RESULTS_DIR / "multiturn_response_eval.json",
     },
+    # Response-as-ground-truth combined: OpenDeception's dialogue_label is
+    # already an outcome-level (response-side) label -- both --target thought
+    # and --target response above already score against it. "combined" adds
+    # a third condition, the post-hoc mean of the independently-computed
+    # thought and response dialogue scores, evaluated against that same
+    # label. No extra LLM call, no joint-audit logic.
+    "combined": {
+        "imt": RESULTS_DIR / "imt_multiturn_gpt4o.json",
+        "round": RESULTS_DIR / "simple_llm_judge_open_deception_round.json",
+        "round_thought": RESULTS_DIR / "simple_llm_judge_open_deception_round_thought.json",
+        "out_txt": RESULTS_DIR / "multiturn_combined_eval.txt",
+        "out_json": RESULTS_DIR / "multiturn_combined_eval.json",
+    },
 }
 
 
@@ -189,31 +202,6 @@ def _cv_threshold_predictions(y_true: List[int], y_score: List[float]) -> Dict[s
     }
 
 
-def _round_overall(round_item: Dict[str, Any], side: str) -> float:
-    audit_key = f"{side}_audit"
-    return _safe_float(round_item.get(audit_key, {}).get("overall_score"), float("nan"))
-
-
-def _aggregate_round_scores(round_scores: List[float]) -> Dict[str, float]:
-    valid = [s for s in round_scores if not np.isnan(s)]
-    if not valid:
-        valid = [0.0]
-    arr = np.array(valid, dtype=float)
-    last3 = arr[-3:]
-    top3 = np.sort(arr)[-3:]
-    return {
-        "max": float(np.max(arr)),
-        "mean": float(np.mean(arr)),
-        "median": float(np.median(arr)),
-        "min": float(np.min(arr)),
-        "last": float(arr[-1]),
-        "last2_mean": float(np.mean(arr[-2:])),
-        "last3_mean": float(np.mean(last3)),
-        "top2_mean": float(np.mean(np.sort(arr)[-2:])),
-        "top3_mean": float(np.mean(top3)),
-    }
-
-
 def _score_stats(y_true: List[int], y_score: List[float]) -> Dict[str, Any]:
     yt = np.array(y_true, dtype=int)
     ys = np.array(y_score, dtype=float)
@@ -290,9 +278,18 @@ def _evaluate_method(
 
 
 def _extract_imt(payload: Dict[str, Any], side: str) -> Dict[str, Any]:
+    """
+    Extract per-dialogue IMT (Decor) scores for one side.
+
+    workflows/multiturn_iu_sis_workflow.py's current output nests dialogue-level
+    scores as dialogue_scores[side][round_agg][dialogue_agg] (e.g. round_agg in
+    {"mean", "max"}, dialogue_agg in {"min", "max", "last"}), flattened here into
+    "round_agg.dialogue_agg" method names, plus a "fixed" method taken directly
+    from fixed_scores[side] -- the workflow's own canonical single-number choice
+    (round-level SIS-weighted mean, then dialogue-level max).
+    """
     positive = set(payload["meta"].get("positive_labels", []))
     negative = set(payload["meta"].get("negative_labels", []))
-    key = side
     source_files, y_true = [], []
     methods: Dict[str, List[float]] = {}
 
@@ -300,11 +297,20 @@ def _extract_imt(payload: Dict[str, Any], side: str) -> Dict[str, Any]:
         binary = _label_to_binary(dialogue.get("dialogue_label", ""), positive, negative)
         if binary is None:
             continue
-        scores = dict(dialogue.get("dialogue_scores", {}).get(key, {}))
-        round_results = dialogue.get("round_results", [])
-        round_scores = [_round_overall(item, side) for item in round_results]
-        if round_scores:
-            scores.update(_aggregate_round_scores(round_scores))
+
+        branch_scores = dialogue.get("dialogue_scores", {}).get(side, {})
+        scores: Dict[str, float] = {}
+        for round_agg, dialogue_aggs in branch_scores.items():
+            if isinstance(dialogue_aggs, dict):
+                for dialogue_agg, value in dialogue_aggs.items():
+                    scores[f"{round_agg}.{dialogue_agg}"] = _safe_float(value)
+            else:
+                scores[str(round_agg)] = _safe_float(dialogue_aggs)
+
+        fixed = dialogue.get("fixed_scores", {}).get(side)
+        if fixed is not None:
+            scores["fixed"] = _safe_float(fixed)
+
         if not scores:
             continue
         source_files.append(dialogue["source_file"])
@@ -312,7 +318,7 @@ def _extract_imt(payload: Dict[str, Any], side: str) -> Dict[str, Any]:
         for method in scores:
             methods.setdefault(method, [])
         for method in methods:
-            methods[method].append(_safe_float(scores.get(method), 0.0))
+            methods[method].append(scores.get(method, 0.0))
 
     return {"source_files": source_files, "y_true": y_true, "methods": methods}
 
@@ -368,6 +374,42 @@ def _validate_alignment(reference: Dict[str, Any], candidate: Dict[str, Any], na
         raise ValueError(f"Source file ordering mismatch for {name}")
     if reference["y_true"] != candidate["y_true"]:
         raise ValueError(f"Ground-truth mismatch for {name}")
+
+
+def _round_payload_is_bundled(payload: Dict[str, Any]) -> bool:
+    """
+    True if one round-baseline payload already carries both thought and
+    response scores (deceptionbench / cot_red_handed / scheming_judge,
+    whose dialogue_aggregation/dialogue_scores are nested by side), False if
+    it's a single-side file (simple_llm_judge, which is run once per
+    --target and needs a matching sibling file for the other side).
+    """
+    dialogues = payload.get("dialogues", [])
+    if not dialogues:
+        return False
+    root = dialogues[0].get("dialogue_aggregation") or dialogues[0].get("dialogue_scores")
+    if root is None:
+        return False
+    return "thought" in root and "response" in root
+
+
+def _combine_sides(thought_extract: Dict[str, Any], response_extract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Post-hoc combined = mean(thought_score, response_score) per dialogue,
+    for every method present on both sides. Uses only the two
+    already-computed, independent per-side scores -- no extra LLM call, no
+    joint-audit logic.
+    """
+    common_methods = sorted(set(thought_extract["methods"]) & set(response_extract["methods"]))
+    methods = {
+        m: [(t + r) / 2.0 for t, r in zip(thought_extract["methods"][m], response_extract["methods"][m])]
+        for m in common_methods
+    }
+    return {
+        "source_files": response_extract["source_files"],
+        "y_true": response_extract["y_true"],
+        "methods": methods,
+    }
 
 
 def _fmt(value: float) -> str:
@@ -486,9 +528,16 @@ def _build_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate multiturn OpenDeception outputs comprehensively")
-    parser.add_argument("--target", choices=("thought", "response"), required=True)
+    parser.add_argument("--target", choices=("thought", "response", "combined"), required=True)
     parser.add_argument("--imt-path", type=Path, default=None, help="Path to multiturn IMT result JSON")
-    parser.add_argument("--round-path", type=Path, default=None, help="Path to round-level baseline JSON")
+    parser.add_argument("--round-path", type=Path, default=None,
+                        help="Path to round-level baseline JSON (response side for --target combined "
+                             "if the family bundles both sides in one file)")
+    parser.add_argument("--round-path-thought", type=Path, default=None,
+                        help="[--target combined only] Path to the thought-side round-level baseline JSON, "
+                             "needed only for a family that outputs one side per file (e.g. simple_llm_judge). "
+                             "Not needed for families that already bundle both sides in --round-path "
+                             "(deceptionbench, cot_red_handed, scheming_judge).")
     parser.add_argument("--out-txt", type=Path, default=None, help="Output txt path")
     parser.add_argument("--out-json", type=Path, default=None, help="Output json path")
     args = parser.parse_args()
@@ -500,7 +549,6 @@ def main() -> None:
         "out_txt": args.out_txt or defaults["out_txt"],
         "out_json": args.out_json or defaults["out_json"],
     }
-
     for key in ("imt", "round"):
         if not paths[key].exists():
             raise FileNotFoundError(f"Missing input file for {key}: {paths[key]}")
@@ -508,8 +556,31 @@ def main() -> None:
     imt_payload = _load_json(paths["imt"])
     round_payload = _load_json(paths["round"])
 
-    imt = _extract_imt(imt_payload, args.target)
-    round_level = _extract_round_baseline(round_payload, args.target)
+    if args.target == "combined":
+        imt_thought = _extract_imt(imt_payload, "thought")
+        imt_response = _extract_imt(imt_payload, "response")
+        _validate_alignment(imt_thought, imt_response, "imt thought vs response")
+        imt = _combine_sides(imt_thought, imt_response)
+
+        if _round_payload_is_bundled(round_payload):
+            round_thought_level = _extract_round_baseline(round_payload, "thought")
+            round_response_level = _extract_round_baseline(round_payload, "response")
+        else:
+            round_thought_path = args.round_path_thought or defaults["round_thought"]
+            if not round_thought_path.exists():
+                raise FileNotFoundError(
+                    f"--target combined: {paths['round']} only contains one side, so the thought-side "
+                    f"sibling file is required too. Missing: {round_thought_path} "
+                    "(pass --round-path-thought explicitly, or bundle both sides in one file)."
+                )
+            round_thought_payload = _load_json(round_thought_path)
+            round_thought_level = _extract_round_baseline(round_thought_payload, "thought")
+            round_response_level = _extract_round_baseline(round_payload, "response")
+        _validate_alignment(round_thought_level, round_response_level, "round baseline thought vs response")
+        round_level = _combine_sides(round_thought_level, round_response_level)
+    else:
+        imt = _extract_imt(imt_payload, args.target)
+        round_level = _extract_round_baseline(round_payload, args.target)
 
     _validate_alignment(imt, round_level, "round baseline")
 

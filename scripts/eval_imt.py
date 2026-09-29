@@ -46,10 +46,13 @@ from project_paths import (
     model_dataset_path,
 )
 from workflows.imt_scores import (
+    CONDITIONS,
     DEFAULT_LABELS,
-    DOMAINS, POOLING_STRATEGIES, RESPONSE_STRATEGY, SIDES, THOUGHT_STRATEGY,
-    aggregate_auroc_runs, aggregate_binary_runs,
-    compute_auroc_all, compute_binary_cv_both_sides,
+    RESPONSE_STRATEGY, SIDES, THOUGHT_STRATEGY,
+    aggregate_auroc_response_gt_runs,
+    aggregate_binary_response_gt_runs,
+    compute_auroc_response_gt,
+    compute_binary_cv_response_gt,
     compute_oof_predictions,
     find_model_files, load_records,
 )
@@ -123,7 +126,17 @@ def eval_model(
     labels_path: Path = DEFAULT_LABELS,
     labeled_out_dir: Path = LABELED_OUT_DIR,
 ) -> dict:
-    """Run AUROC + 5-fold binary CV across all run files for a model."""
+    """
+    Run AUROC + 5-fold binary CV across all run files for a model.
+
+    Reports exactly two conditions (see workflows.imt_scores.CONDITIONS),
+    both scored against the response's own human label:
+      - "response": response-only score (RESPONSE_STRATEGY = full_avg)
+      - "combined": "Thought & Response" -- post-hoc mean of the
+        independently-computed thought and response scores. No extra LLM
+        call or joint-audit logic is involved.
+    There is no standalone Thought-vs-its-own-label AUROC.
+    """
     print(f"\n  {model}  ({len(files)} run(s))")
     auroc_runs, binary_runs, data_counts = [], [], []
 
@@ -134,8 +147,8 @@ def eval_model(
             continue
         valid_counts = _count_valid_records(records)
         print(f"    {path.name}: {len(records)} records  [thought={valid_counts['thought']}, response={valid_counts['response']} valid]")
-        auroc_runs.append(compute_auroc_all(records))
-        binary_runs.append(compute_binary_cv_both_sides(records))
+        auroc_runs.append(compute_auroc_response_gt(records))
+        binary_runs.append(compute_binary_cv_response_gt(records))
         data_counts.append({"file": path.name, "total": len(records), **valid_counts})
 
         # Generate labeled JSON with OOF predictions
@@ -150,10 +163,13 @@ def eval_model(
         auroc_result  = {"single": auroc_runs[0]}
         binary_result = {"single": binary_runs[0]}
     else:
-        auroc_result  = aggregate_auroc_runs(auroc_runs)
-        binary_result = aggregate_binary_runs(binary_runs)
+        auroc_result  = aggregate_auroc_response_gt_runs(auroc_runs)
+        binary_result = aggregate_binary_response_gt_runs(binary_runs)
 
-    return {"auroc": auroc_result, "binary": binary_result, "runs": len(auroc_runs), "data_counts": data_counts}
+    return {
+        "auroc": auroc_result, "binary": binary_result,
+        "runs": len(auroc_runs), "data_counts": data_counts,
+    }
 
 
 # ── Summary formatting ────────────────────────────────────────────────────────
@@ -169,16 +185,12 @@ def _get(block: dict, key: str) -> tuple[float, float]:
     return float("nan"), float("nan")
 
 
-def _get_auroc(auroc_block: dict, side: str, strategy: str, domain: str = "Overall") -> tuple[float, float]:
+def _get_response_gt_auroc(auroc_block: dict, condition: str, domain: str = "Overall") -> tuple[float, float]:
     if "mean" in auroc_block:
-        m = auroc_block["mean"][side][strategy][domain]
-        s = auroc_block["std"][side][strategy][domain]
-    elif "single" in auroc_block:
-        m = auroc_block["single"][side][strategy][domain]
-        s = float("nan")
-    else:
-        return float("nan"), float("nan")
-    return m, s
+        return auroc_block["mean"][condition][domain], auroc_block["std"][condition][domain]
+    if "single" in auroc_block:
+        return auroc_block["single"][condition][domain], float("nan")
+    return float("nan"), float("nan")
 
 
 def _fmt(mean: float, std: float) -> str:
@@ -187,10 +199,14 @@ def _fmt(mean: float, std: float) -> str:
     return f"{mean:.4f}±{std:.4f}"
 
 
+CONDITION_LABELS = {"response": "Response", "combined": "Thought & Response"}
+
+
 def build_summary(all_results: dict) -> str:
     lines = []
     lines.append("IMT Evaluation Summary")
-    lines.append(f"Config: thought={THOUGHT_STRATEGY}, response={RESPONSE_STRATEGY}, 5-fold CV, domain-specific threshold")
+    lines.append(f"Config: response={RESPONSE_STRATEGY}, thought={THOUGHT_STRATEGY} (used only inside Thought & Response), 5-fold CV, domain-specific threshold")
+    lines.append("Ground truth: human_eval.response for both conditions below (Thought & Response = mean(thought, response) score)")
     lines.append("")
 
     for model, result in sorted(all_results.items()):
@@ -206,20 +222,18 @@ def build_summary(all_results: dict) -> str:
         auroc_b  = result["auroc"]
         binary_b = result["binary"]
 
-        for side, strategy in (("thought", THOUGHT_STRATEGY), ("response", RESPONSE_STRATEGY)):
-            auroc_m, auroc_s = _get_auroc(auroc_b, side, strategy)
-            bin_block = binary_b.get("mean", binary_b.get("single", {}))
-            side_block = bin_block.get(side, {}) if "mean" in binary_b else bin_block.get(side, {})
+        for condition in CONDITIONS:
+            auroc_m, auroc_s = _get_response_gt_auroc(auroc_b, condition)
 
-            lines.append(f"  {side.capitalize()}  (strategy={strategy})")
+            lines.append(f"  {CONDITION_LABELS[condition]}")
             lines.append(f"    AUROC         : {_fmt(auroc_m, auroc_s)}")
 
             for key, label in METRIC_LABELS.items():
                 if "mean" in binary_b:
-                    m = binary_b["mean"][side].get(key, float("nan"))
-                    s = binary_b["std"][side].get(key, float("nan"))
+                    m = binary_b["mean"][condition].get(key, float("nan"))
+                    s = binary_b["std"][condition].get(key, float("nan"))
                 else:
-                    base = binary_b["single"][side]
+                    base = binary_b["single"][condition]
                     if key == "auprc_oof":
                         m = base.get("auprc_oof", float("nan"))
                         s = float("nan")

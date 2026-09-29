@@ -4,16 +4,21 @@ workflows/imt_scores.py
 Core scoring functions for IMT audit result files.
 
 Provides two capabilities:
-  1. AUROC computation across all pooling strategies and domains.
+  1. AUROC computation for response/combined across domains.
   2. 5-fold stratified binary classification metrics (Macro-F1, AUPRC,
      Accuracy, Balanced Accuracy, Precision, Recall).
 
 Fixed evaluation configuration (consistent across all callers):
   - Thought  : full_avg pooling, SIS-weighted average across all IUs
-  - Response : decisive_avg pooling, SIS-weighted average over decisive IUs
+  - Response : full_avg pooling, SIS-weighted average across all IUs
   - Threshold: maximise Macro-F1 on each training fold
   - Threshold: fit separately per domain (topic)
   - Folds    : 5, stratified, seed=42
+
+Headline metrics are the two CONDITIONS below, both evaluated against the
+Response's own human label: "response" (response-only score) and "combined"
+("Thought & Response" = mean of the thought and response scores). There is
+no standalone Thought-vs-its-own-label metric.
 """
 
 from __future__ import annotations
@@ -44,6 +49,17 @@ DOMAINS = ["Economy", "Education", "Entertainment", "Healthcare", "Social Intera
 IMT_DIMS = ("quantity", "quality", "relation", "manner")
 SIDES = ("thought", "response")
 
+# Headline conditions: two ways of scoring an item, both evaluated against
+# label_response only. Only the Response is what actually reaches/affects
+# the user -- Thought is internal reasoning -- so there is no standalone
+# Thought-vs-its-own-label metric.
+#   - "response" : score_response[RESPONSE_STRATEGY]   vs label_response
+#   - "combined" : mean(thought score, response score) vs label_response --
+#     a plain post-hoc average of the two independently-computed scores
+#     ("Thought & Response"). No extra LLM call and no joint-audit logic
+#     is involved.
+CONDITIONS = ("response", "combined")
+
 # All pooling strategies = IU-subset × dim-aggregation-mode
 POOLING_STRATEGIES = [
     "full_avg", "full_max",
@@ -60,7 +76,7 @@ _SUBSET_SIS: Dict[str, Set[int]] = {
 
 # Fixed evaluation config
 THOUGHT_STRATEGY  = "full_avg"
-RESPONSE_STRATEGY = "decisive_avg"
+RESPONSE_STRATEGY = "full_avg"
 N_FOLDS = 5
 FOLD_SEED = 42
 
@@ -204,48 +220,50 @@ def _auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(roc_auc_score(y_true, y_score))
 
 
-def compute_auroc_all(records: List[Dict]) -> Dict:
-    """
-    Compute AUROC for both sides × all strategies × Overall + 5 domains.
+def _condition_score(record: Dict, condition: str) -> float:
+    """Score for one of CONDITIONS, using the fixed (THOUGHT_STRATEGY, RESPONSE_STRATEGY) pooling."""
+    t = record["score_thought"].get(THOUGHT_STRATEGY, float("nan"))
+    r = record["score_response"].get(RESPONSE_STRATEGY, float("nan"))
+    if condition == "response":
+        return r
+    if np.isnan(t) or np.isnan(r):
+        return float("nan")
+    return (t + r) / 2.0
 
-    Returns: {side: {strategy: {domain: float}}}
+
+def compute_auroc_response_gt(records: List[Dict]) -> Dict:
+    """
+    AUROC for response/combined (see CONDITIONS), all evaluated
+    against label_response, at Overall + per-domain granularity.
+
+    Returns: {condition: {domain: float}}
     """
     out: Dict = {}
-    for side in SIDES:
-        score_key = f"score_{side}"
-        label_key = f"label_{side}"
-        out[side] = {}
-        for strategy in POOLING_STRATEGIES:
-            out[side][strategy] = {}
-            y_true_all  = np.array([r[label_key]           for r in records], dtype=float)
-            y_score_all = np.array([r[score_key][strategy] for r in records], dtype=float)
-            # Filter out records where this side's assessment was missing (score=nan)
-            valid = ~np.isnan(y_score_all)
-            out[side][strategy]["Overall"] = _auroc(y_true_all[valid].astype(int),
-                                                    y_score_all[valid])
-            for domain in DOMAINS:
-                idx = np.array([i for i, r in enumerate(records)
-                                if r["topic"] == domain and valid[i]])
-                if not len(idx):
-                    out[side][strategy][domain] = float("nan")
-                else:
-                    out[side][strategy][domain] = _auroc(y_true_all[idx].astype(int),
-                                                        y_score_all[idx])
+    for condition in CONDITIONS:
+        out[condition] = {}
+        y_true_all  = np.array([r["label_response"]              for r in records], dtype=float)
+        y_score_all = np.array([_condition_score(r, condition)   for r in records], dtype=float)
+        valid = ~np.isnan(y_score_all)
+        out[condition]["Overall"] = _auroc(y_true_all[valid].astype(int), y_score_all[valid])
+        for domain in DOMAINS:
+            idx = np.array([i for i, r in enumerate(records)
+                            if r["topic"] == domain and valid[i]])
+            if not len(idx):
+                out[condition][domain] = float("nan")
+            else:
+                out[condition][domain] = _auroc(y_true_all[idx].astype(int), y_score_all[idx])
     return out
 
 
-def aggregate_auroc_runs(run_results: List[Dict]) -> Dict:
-    """Mean ± std across multiple runs for each (side, strategy, domain)."""
+def aggregate_auroc_response_gt_runs(run_results: List[Dict]) -> Dict:
+    """Mean ± std across multiple runs for each (condition, domain)."""
     mean, std = {}, {}
-    for side in SIDES:
-        mean[side], std[side] = {}, {}
-        for strategy in POOLING_STRATEGIES:
-            mean[side][strategy], std[side][strategy] = {}, {}
-            for domain in ["Overall"] + DOMAINS:
-                vals = [r[side][strategy][domain] for r in run_results
-                        if not np.isnan(r[side][strategy][domain])]
-                mean[side][strategy][domain] = float(np.mean(vals))  if vals else float("nan")
-                std[side][strategy][domain]  = float(np.std(vals))   if vals else float("nan")
+    for condition in CONDITIONS:
+        mean[condition], std[condition] = {}, {}
+        for domain in ["Overall"] + DOMAINS:
+            vals = [r[condition][domain] for r in run_results if not np.isnan(r[condition][domain])]
+            mean[condition][domain] = float(np.mean(vals)) if vals else float("nan")
+            std[condition][domain]  = float(np.std(vals))  if vals else float("nan")
     return {"mean": mean, "std": std}
 
 
@@ -278,24 +296,18 @@ def _binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray)
     }
 
 
-def compute_binary_cv(
-    records: List[Dict],
-    side: str,
-    strategy: str,
+def _binary_cv_core(
+    topics_all: np.ndarray,
+    y_true_all: np.ndarray,
+    y_score_all: np.ndarray,
 ) -> Dict:
     """
-    5-fold stratified CV on (side, strategy).
+    5-fold stratified CV shared by every (label, score) pairing.
 
     Threshold is chosen per-domain on the training fold to maximise Macro-F1.
     Returns {metric: mean, std} over folds.
     """
-    score_key = f"score_{side}"
-    label_key = f"label_{side}"
-    topics_all  = np.array([r["topic"]           for r in records], dtype=object)
-    y_true_all  = np.array([r[label_key]          for r in records], dtype=int)
-    y_score_all = np.array([r[score_key][strategy] for r in records], dtype=float)
-
-    # Filter out records where this side's assessment was missing (score=nan)
+    # Filter out records where this score was missing (score=nan)
     valid = ~np.isnan(y_score_all)
     topics  = topics_all[valid]
     y_true  = y_true_all[valid]
@@ -307,7 +319,7 @@ def compute_binary_cv(
     class_counts = np.bincount(y_true) if len(y_true) else np.array([])
     if len(y_score) < N_FOLDS or len(np.unique(y_true)) < 2 or class_counts.min() < N_FOLDS:
         nan_summary = {f"{k}_{s}": float("nan")
-                       for k in ("macro_f1", "accuracy", "balanced_acc", "precision", "recall", "auprc")
+                       for k in ("f1", "acc", "balanced_acc", "precision", "recall", "auprc", "fpr", "fnr")
                        for s in ("mean", "std")}
         nan_summary["auprc_oof"] = float("nan")
         return nan_summary
@@ -355,33 +367,36 @@ def compute_binary_cv(
     return summary
 
 
-def compute_binary_cv_both_sides(records: List[Dict]) -> Dict:
+def compute_binary_cv_response_gt(records: List[Dict]) -> Dict:
     """
-    Run 5-fold CV for the fixed (thought=full_avg, response=decisive_avg) config.
+    5-fold stratified CV for response/combined (see CONDITIONS),
+    all evaluated against label_response.
 
-    Returns: {side: {metric_mean/std: float, auprc_oof: float}}
+    Returns: {condition: {metric_mean/std: float, auprc_oof: float}}
     """
-    return {
-        "thought":  compute_binary_cv(records, "thought",  THOUGHT_STRATEGY),
-        "response": compute_binary_cv(records, "response", RESPONSE_STRATEGY),
-    }
+    topics_all = np.array([r["topic"]          for r in records], dtype=object)
+    y_true_all = np.array([r["label_response"] for r in records], dtype=int)
+    out = {}
+    for condition in CONDITIONS:
+        y_score_all = np.array([_condition_score(r, condition) for r in records], dtype=float)
+        out[condition] = _binary_cv_core(topics_all, y_true_all, y_score_all)
+    return out
 
 
-def aggregate_binary_runs(run_results: List[Dict]) -> Dict:
-    """Mean ± std across multiple runs for binary metrics."""
-    mean, std = {"thought": {}, "response": {}}, {"thought": {}, "response": {}}
-    keys = [k for k in run_results[0]["thought"] if k.endswith("_mean")]
+def aggregate_binary_response_gt_runs(run_results: List[Dict]) -> Dict:
+    """Mean ± std across multiple runs for binary response-gt metrics."""
+    mean, std = {c: {} for c in CONDITIONS}, {c: {} for c in CONDITIONS}
+    keys = [k for k in run_results[0][CONDITIONS[0]] if k.endswith("_mean")]
     metric_names = [k[:-5] for k in keys]  # strip "_mean"
 
-    for side in SIDES:
+    for condition in CONDITIONS:
         for metric in metric_names:
-            vals = np.array([r[side][f"{metric}_mean"] for r in run_results], dtype=float)
-            mean[side][metric] = round(float(np.nanmean(vals)), 4)
-            std[side][metric]  = round(float(np.nanstd(vals)),  4)
-        # OOF AUPRC across runs
-        oof_vals = np.array([r[side]["auprc_oof"] for r in run_results], dtype=float)
-        mean[side]["auprc_oof"] = round(float(np.nanmean(oof_vals)), 4)
-        std[side]["auprc_oof"]  = round(float(np.nanstd(oof_vals)),  4)
+            vals = np.array([r[condition][f"{metric}_mean"] for r in run_results], dtype=float)
+            mean[condition][metric] = round(float(np.nanmean(vals)), 4)
+            std[condition][metric]  = round(float(np.nanstd(vals)),  4)
+        oof_vals = np.array([r[condition]["auprc_oof"] for r in run_results], dtype=float)
+        mean[condition]["auprc_oof"] = round(float(np.nanmean(oof_vals)), 4)
+        std[condition]["auprc_oof"]  = round(float(np.nanstd(oof_vals)),  4)
 
     return {"mean": mean, "std": std}
 
@@ -392,7 +407,10 @@ def compute_oof_predictions(records: List[Dict]) -> Dict[tuple, Dict[str, int]]:
     """
     Run 5-fold stratified CV for both sides and return OOF binary predictions.
 
-    Uses the same domain-specific threshold logic as compute_binary_cv.
+    Each side is evaluated against its own human label (used only to
+    populate the diagnostic "eval" annotations written by
+    scripts/eval_imt.py's _write_labeled_json; the headline metrics use
+    CONDITIONS / compute_binary_cv_response_gt instead).
 
     Returns: {_key: {"thought": 0|1, "response": 0|1}}
     where _key is (topic, question, l2_type) stored in each record.

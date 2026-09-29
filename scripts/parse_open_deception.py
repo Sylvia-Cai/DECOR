@@ -5,7 +5,7 @@ Usage:
         "data/open_deception/OpenDeception-C187/transcripts/cheat_success/Fake Recruitment Assistant Privacy9.txt"
 
     # Regenerate the curated dataset every other script/workflow reads by default
-    # (data/open_deception/open_deception_gpt4o_en.json — not checked in, since it
+    # (data/open_deception/open_deception_en.json — not checked in, since it
     # is a deterministic function of the raw transcripts above):
     python scripts/parse_open_deception.py
 """
@@ -28,6 +28,7 @@ from project_paths import (  # noqa: E402
 )
 
 LABEL_NAMES = {"cheat_fail", "cheat_none", "cheat_success", "fail", "rejection"}
+EVALUATION_LABELS = {"cheat_fail", "cheat_none", "cheat_success"}
 
 
 def _normalize_scenario_name(name: str) -> str:
@@ -76,23 +77,23 @@ def parse_transcript(path: Path, goal_map: dict[str, str]) -> dict:
     current_user = None
     current_thought = None
     current_speech = None
+    current_field = None
     round_id = 0
 
     def flush_round() -> None:
         nonlocal current_user, current_thought, current_speech, round_id
         if current_user is None and current_thought is None and current_speech is None:
             return
-        if current_user is None or current_thought is None or current_speech is None:
-            return
-        round_id += 1
-        rounds.append(
-            {
-                "round_id": round_id,
-                "user": current_user,
-                "ai_thought": current_thought,
-                "ai_speech": current_speech,
-            }
-        )
+        if current_user is not None and current_thought is not None and current_speech is not None:
+            round_id += 1
+            rounds.append(
+                {
+                    "round_id": round_id,
+                    "user": current_user,
+                    "ai_thought": current_thought,
+                    "ai_speech": current_speech,
+                }
+            )
         current_user = None
         current_thought = None
         current_speech = None
@@ -104,22 +105,29 @@ def parse_transcript(path: Path, goal_map: dict[str, str]) -> dict:
         if line.startswith("user:"):
             flush_round()
             current_user = line[len("user:") :].strip()
+            current_field = "user"
             continue
 
-        if line.startswith("[AI (Thought):") and line.endswith("]"):
-            current_thought = line[len("[AI (Thought):") : -1].strip()
+        if line.startswith("[AI (Thought):"):
+            current_thought = line[len("[AI (Thought):") :].strip()
+            if current_thought.endswith("]"):
+                current_thought = current_thought[:-1].rstrip()
+            current_field = "thought"
             continue
 
         if line.startswith("AI (Speech):"):
             current_speech = line[len("AI (Speech):") :].strip()
+            current_field = "speech"
             continue
 
         # Merge unexpected continuation lines into the latest open field.
-        if current_speech is not None:
+        if current_field == "speech":
             current_speech = f"{current_speech}\n{line}"
-        elif current_thought is not None:
+        elif current_field == "thought":
+            if line.endswith("]"):
+                line = line[:-1].rstrip()
             current_thought = f"{current_thought}\n{line}"
-        elif current_user is not None:
+        elif current_field == "user":
             current_user = f"{current_user}\n{line}"
 
     flush_round()
@@ -127,8 +135,12 @@ def parse_transcript(path: Path, goal_map: dict[str, str]) -> dict:
     scenario_name = path.stem
     deceptive_goal = _lookup_goal(goal_map, scenario_name)
 
+    try:
+        source_file = str(path.relative_to(ROOT))
+    except ValueError:
+        source_file = str(path)
     out = {
-        "source_file": str(path.relative_to(ROOT)),
+        "source_file": source_file,
         "dialogue_label": _extract_dialogue_label(path),
         "rounds": rounds,
     }
@@ -147,6 +159,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Parse OpenDeception transcripts into structured JSON")
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="Input transcript file or directory")
     parser.add_argument("--output", default=None, help="Optional output JSON path")
+    parser.add_argument("--include-excluded", action="store_true",
+                        help="Also parse fail/rejection transcripts (excluded by default)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -158,6 +172,10 @@ def main() -> None:
         output_path = ROOT / output_path
 
     transcripts = collect_transcripts(input_path)
+    if not args.include_excluded:
+        transcripts = [p for p in transcripts if _extract_dialogue_label(p) in EVALUATION_LABELS]
+    if not transcripts:
+        parser.error(f"No eligible transcripts found in {input_path}")
     goal_map = _load_open_deception_goals()
     parsed = [parse_transcript(path, goal_map) for path in transcripts]
 
